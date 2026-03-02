@@ -187,58 +187,42 @@ gtk-im-module=fcitx
 gsettings set org.gnome.settings-daemon.plugins.xsettings overrides "{'Gtk/IMModule':<'fcitx'>}"
 ```
 
-## 用 systemd 管理 Fcitx5
+## 启动 Fcitx5
 
-### 创建 service 文件
+### 推荐方式：在合成器 init 中直接启动
 
-如果你的发行版没有自带 fcitx5 的 systemd unit：
+Fcitx5 本身就是 daemon（`-d` 参数 daemonize），它自己管理生命周期、处理信号、重连 wayland socket。不需要额外的进程管理器。
 
-```bash
-mkdir -p ~/.config/systemd/user
-
-cat > ~/.config/systemd/user/fcitx5.service << 'EOF'
-[Unit]
-Description=Fcitx5 Input Method
-After=graphical-session.target
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/fcitx5
-Restart=on-failure
-RestartSec=3
-
-[Install]
-WantedBy=graphical-session.target
-EOF
-```
-
-### 启用服务
+在合成器的 init 脚本中（如 River 的 init 或 Rijan 配置文件）：
 
 ```bash
-systemctl --user daemon-reload
-systemctl --user enable fcitx5    # 开机自启
-systemctl --user start fcitx5     # 立即启动
+# 先同步环境变量给 D-Bus 和 systemd
+dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP DISPLAY
+
+# 启动 fcitx5（pgrep 防止重复启动，比如重载配置时）
+pgrep -x fcitx5 > /dev/null || fcitx5 -d &
 ```
 
-### River init 配置
+这是最简洁、最可靠的方式。当合成器退出时 wayland socket 断开，fcitx5 自然退出，不需要手动清理。
 
-在 `~/.config/river/init` 中加入 systemd 集成（让 systemd 知道 Wayland 已启动）：
+### 为什么不推荐 systemd 管理 Fcitx5
 
-```bash
-systemctl --user import-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP
-dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP
-```
+用 systemd user service 管理 fcitx5 看起来"正规"，但在 wlroots 系合成器（River、Sway 等）下会引入不必要的复杂度：
 
-**同时删掉** init 里手动启动 fcitx5 的行（如 `fcitx5 -d &`），避免重复启动。
+1. **需要手动激活 graphical-session.target** — KDE/GNOME 的 session manager 会自动做，但 River/Sway 不会。你必须在 init 里加 `systemctl --user start graphical-session.target`，否则 service 不会被拉起。
 
-### 常用命令
+2. **需要 import-environment** — systemd user manager 看不到 `WAYLAND_DISPLAY`，必须手动导入，否则 fcitx5 找不到 wayland socket。
 
-```bash
-systemctl --user status fcitx5     # 查看状态
-systemctl --user restart fcitx5    # 重启
-systemctl --user stop fcitx5       # 停止
-journalctl --user -u fcitx5        # 查看日志
-```
+3. **三个活动部件**（service 文件 + import-environment + graphical-session.target），任何一个配错输入法就不起来，且排查困难。
+
+相比之下，直接 `fcitx5 -d &` 一行搞定，没有额外依赖。
+
+### 注意事项：XWayland 应用启动时序
+
+如果你在 init 中同时 autostart XWayland 应用（如微信），应用可能在键盘布局和输入法完全就绪前启动，导致使用默认布局。解决方法：
+
+- 给 autostart 的 XWayland 应用加延迟：`sleep 2 && wechat &`
+- 或者等合成器初始化完成通知后再手动打开
 
 ## Chromium / Electron 应用
 
