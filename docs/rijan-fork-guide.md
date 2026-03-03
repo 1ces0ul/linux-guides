@@ -69,6 +69,71 @@ Isaac 的原版 Rijan 是一个极简但完整的平铺窗口管理器，约 650
 
 我加了 `clamp-to-hints` 函数：布局先分配空间（layout box），然后根据窗口的尺寸提示约束实际大小，居中放置，并用 `set-clip-box` 裁剪溢出部分。
 
+### 窗口装饰与边框绘制修复（decoration-hint）
+
+**问题：** 所有窗口都没有 River 绘制的服务端边框 (SSD)。
+
+**根因：** `river_layout_manager_v1` 协议中的 `decoration_hint` 枚举值在 Janet 的 Wayland 绑定层中会被自动转换为 keyword：
+
+| 协议整数 | Janet keyword | 含义 | 典型窗口 |
+|:---------|:--------------|:-----|:---------|
+| `0` | `:only-supports-csd` | 只支持 CSD | Telegram, Chrome, 无 MOTIF 的 X11 应用 |
+| `1` | `:prefers-csd` | 偏好 CSD | WeChat (MOTIF `no_border`) |
+| `2` | `:prefers-ssd` | 偏好 SSD | GTK4 应用, 有 MOTIF 装饰的 X11 应用 |
+| `3` | `:no-preference` | 无偏好 | 仅 XDG toplevel |
+
+然而代码中用整数 `(= hint 0)` 与 keyword 比较，永远为 false，导致边框逻辑全部失效。
+
+**修复：** 将所有整数比较改为 keyword 比较，默认回退值从 `3` 改为 `:no-preference`。
+
+**修复后的边框绘制决策：**
+
+| 窗口类型 | 画边框？ | 装饰模式 |
+|:---------|:---------|:---------|
+| 子窗口 (`managed-as-child`) | ✗ 不画 | 无 |
+| 独立顶层 + focused (hint 2/3) | ✓ 画 (focused 颜色) | `use-ssd` |
+| 独立顶层 + unfocused (hint 2/3) | ✓ 画 (normal 颜色) | `use-ssd` |
+| CSD 窗口 (hint 0/1) | ✗ 不画 | `use-csd` |
+| 全屏窗口 | ✓ 画* | `use-ssd` |
+
+\*协议规定全屏时边框不显示。
+
+### Rijan 窗口识别与绘制流程概览
+
+```
+River 事件循环
+│
+├── [:window obj] → window/create
+│   创建窗口, :new=true, 注册事件(app-id, parent, decoration-hint...)
+│
+├── [:manage-start] → wm/manage
+│   ├── 清理已关闭窗口
+│   ├── window/manage (仅 :new)
+│   │   ├── parent-event? YES → 子窗口 (float, 不调用 use-ssd/csd)
+│   │   └── parent-event? NO  → 独立窗口
+│   │       ├── decoration-hint → use-csd 或 use-ssd
+│   │       ├── is-partially-fixed? → float/tile
+│   │       └── 分配 tag
+│   ├── seat/manage (焦点)
+│   ├── wm/layout (仅 tiled 窗口)
+│   │   ├── :tile → master-stack
+│   │   ├── :scroller → scroller
+│   │   └── :grid → grid
+│   └── wm/show-hide
+│
+└── [:render-start] → wm/render
+    └── window/render
+        ├── 初始定位 (parent居中/output居中/layout)
+        ├── Z序 (子窗口在parent上方)
+        ├── Border (managed-as-child→无, CSD→无, SSD→有)
+        └── Clip box (tiled裁剪)
+```
+
+**border-width (默认 2px) 参与的计算：**
+`set-position`(+bw), `propose-dimensions`(-2×bw), `center-on-output`(-2×bw), 子窗口定位(+bw), `clamp-to-hints`, `clip-box`, `float-move/resize/snap`
+
+> 注意：子窗口在 manage 阶段直接调用 `(:propose-dimensions ...)` 不经过 `window/propose-dimensions` 包装，不减 border-width。
+
 ### 3. 子窗口/弹窗处理的全面重写
 
 这是改动量最大的部分。原版对子窗口的处理很简单：有 parent 就浮动，tag 跟随 parent。但实际使用中会遇到很多边界情况：
